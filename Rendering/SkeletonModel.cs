@@ -20,10 +20,27 @@ public sealed class SkeletonModel : IDisposable
 
     // 图集页 → SKImage
     private readonly Dictionary<AtlasPage, SKImage> _images = new();
+
+    // 动画名缓存：这个属性被 UI 高频访问（设置面板每个按键行都会取一次），
+    // 原来每次访问都 new 一个 List，纯浪费。
+    private readonly List<string> _animationNames = new();
+
     private bool _disposed;
 
     /// <summary>模型自然包围盒（Spine 本地坐标，未缩放），用于确定绘制基准。</summary>
     public (float MinX, float MinY, float MaxX, float MaxY) Bounds { get; }
+
+    /// <summary>
+    /// 角色锚点的 X：身体中轴（Spine 本地坐标）。
+    /// 取自「头部带」顶点的 x 中位数 —— 中位数天然忽略伸出去的武器/披风。
+    /// </summary>
+    public float AnchorX { get; private set; }
+
+    /// <summary>
+    /// 角色锚点的 Y：脚底（Spine 本地坐标，Y 向上）。
+    /// 取自待机动画全部顶点 y 的 2% 分位 —— 跳过偶尔出现的脚下光圈/剑尖插地。
+    /// </summary>
+    public float AnchorY { get; private set; }
 
     public SkeletonModel(string atlasPath, string skelPath, float defaultMix = 0.15f)
     {
@@ -40,7 +57,13 @@ public sealed class SkeletonModel : IDisposable
         var stateData = new AnimationStateData(Data) { DefaultMix = defaultMix };
         State = new AnimationState(stateData);
 
+        foreach (var a in Data.Animations) _animationNames.Add(a.Name);
+
         Bounds = ComputeBounds();
+
+        var anchor = ComputeAnchor();
+        AnchorX = anchor.X;
+        AnchorY = anchor.Y;
     }
 
     /// <summary>取某个区域对应的贴图（RegionAttachment / MeshAttachment 共用）。</summary>
@@ -59,16 +82,8 @@ public sealed class SkeletonModel : IDisposable
     public float PageHeight(TextureRegion region) =>
         (region is AtlasRegion ar && ar.page != null) ? ar.page.height : region.height;
 
-    /// <summary>动画名列表（用于设置面板下拉）。</summary>
-    public IReadOnlyList<string> AnimationNames
-    {
-        get
-        {
-            var list = new List<string>();
-            foreach (var a in Data.Animations) list.Add(a.Name);
-            return list;
-        }
-    }
+    /// <summary>动画名列表（用于设置面板下拉）。构造时算好，之后只读。</summary>
+    public IReadOnlyList<string> AnimationNames => _animationNames;
 
     public bool HasAnimation(string name) => Data.FindAnimation(name) != null;
 
@@ -105,51 +120,250 @@ public sealed class SkeletonModel : IDisposable
 
     private (float, float, float, float) ComputeBounds()
     {
-        // 采样首个动画若干帧，取最大包围盒；否则退回 setup pose。
-        float minX = float.MaxValue, minY = float.MaxValue, maxX = float.MinValue, maxY = float.MinValue;
-        void Accumulate()
+        // 逐帧采样，每帧记一个包围盒，最后做统计而不是简单取全局 min/max。
+        //
+        // 为什么：部分 Spine 模型里 born / posture 这类动画会把骨架整体位移到很远
+        // （实测有模型跑到 x≈-999）。直接对所有帧取绝对 min/max，包围盒会被撑成
+        // 1200+ 宽，渲染时按框缩放，桌宠就变成一小只还偏在一边。
+        var frames = new List<(float X0, float Y0, float X1, float Y1)>();
+
+        void SampleFrame()
         {
             Skeleton.UpdateWorldTransform(Skeleton.Physics.None);
-            var arr = new float[8];
+
+            float fx0 = float.MaxValue, fy0 = float.MaxValue;
+            float fx1 = float.MinValue, fy1 = float.MinValue;
+
             foreach (var slot in Skeleton.DrawOrder)
             {
-                var att = slot.Attachment;
-                if (att is VertexAttachment va && va.WorldVerticesLength >= 2)
+                if (slot.Attachment is not VertexAttachment va || va.WorldVerticesLength < 2) continue;
+
+                var verts = new float[va.WorldVerticesLength];
+                va.ComputeWorldVertices(slot, verts);
+                for (int i = 0; i + 1 < verts.Length; i += 2)
                 {
-                    var verts = new float[va.WorldVerticesLength];
-                    va.ComputeWorldVertices(slot, verts);
-                    for (int i = 0; i + 1 < verts.Length; i += 2)
-                    {
-                        if (verts[i] < minX) minX = verts[i];
-                        if (verts[i] > maxX) maxX = verts[i];
-                        if (verts[i + 1] < minY) minY = verts[i + 1];
-                        if (verts[i + 1] > maxY) maxY = verts[i + 1];
-                    }
+                    if (verts[i] < fx0) fx0 = verts[i];
+                    if (verts[i] > fx1) fx1 = verts[i];
+                    if (verts[i + 1] < fy0) fy0 = verts[i + 1];
+                    if (verts[i + 1] > fy1) fy1 = verts[i + 1];
                 }
             }
+
+            if (fx0 <= fx1 && fy0 <= fy1) frames.Add((fx0, fy0, fx1, fy1));
         }
 
-        // 遍历「所有」动画采样：只取首个动画会让其它动作摆幅更大时被窗口裁切
-        bool sampled = false;
+        // 遍历「所有」动画采样。
+        //
+        // 每动画 49 帧（原来只有 13 帧）：采样太稀会让快速摆动的极值落在两个采样点
+        // 之间，静态包围盒就会偏小，运行时表现为"渲染超出窗口"。
         foreach (var anim in Data.Animations)
         {
             float dur = anim.Duration <= 0 ? 0.1f : anim.Duration;
-            const int steps = 12;
+            const int steps = 48;
             for (int i = 0; i <= steps; i++)
             {
                 anim.Apply(Skeleton, 0f, dur * i / steps, false, null, 1f, MixBlend.Setup, MixDirection.In);
-                Accumulate();
-                sampled = true;
+                SampleFrame();
             }
         }
-        if (!sampled) Accumulate();
 
+        // 恢复干净状态交给调用方
         Skeleton.SetToSetupPose();
         State.Apply(Skeleton);
         Skeleton.UpdateWorldTransform(Skeleton.Physics.None);
 
-        if (minX > maxX) return (-100, -100, 100, 100);
-        return (minX, minY, maxX, maxY);
+        // 一个动画都没有 → 用 setup pose 自己当包围盒
+        if (frames.Count == 0) SampleFrame();
+        if (frames.Count == 0) return (-100, -100, 100, 100);
+
+        // 绝对框
+        float x0 = float.MaxValue, y0 = float.MaxValue, x1 = float.MinValue, y1 = float.MinValue;
+        foreach (var f in frames)
+        {
+            if (f.X0 < x0) x0 = f.X0;
+            if (f.Y0 < y0) y0 = f.Y0;
+            if (f.X1 > x1) x1 = f.X1;
+            if (f.Y1 > y1) y1 = f.Y1;
+        }
+
+        // 分位框：砍掉最极端的各 10% 帧
+        var q = QuantileBox(frames);
+
+        // 只有绝对框被少数极端帧撑大到 2.2 倍以上，才改用它。
+        // 阈值定得比较高：宁可包围盒偏大（角色略小），也不要因为误判而裁掉动作。
+        float aw = Math.Max(1e-3f, x1 - x0), ah = Math.Max(1e-3f, y1 - y0);
+        float qw = Math.Max(1e-3f, q.X1 - q.X0), qh = Math.Max(1e-3f, q.Y1 - q.Y0);
+
+        if (aw > qw * 2.2f || ah > qh * 2.2f)
+        {
+            Logger.Log($"[Bounds] 检测到极端位移帧，改用分位包围盒 {qw:0}x{qh:0}（绝对框 {aw:0}x{ah:0}）");
+            LogBoundsDiagnosis(frames, q.X0, q.Y0, q.X1, q.Y1);
+            return q;
+        }
+
+        LogBoundsDiagnosis(frames, x0, y0, x1, y1);
+        return (x0, y0, x1, y1);
+    }
+
+    /// <summary>
+    /// 用「头顶 → 脚底」的轮廓算角色锚点，而不是用包围盒中心。
+    ///
+    /// 为什么不用包围盒中心：不同皮肤的框里，角色站的位置并不一样 ——
+    /// 有的头顶留白多，有的披风/长剑把框拉宽，还有的脚下带一圈特效。
+    /// 直接把包围盒中心对准窗口中心，换皮肤时脚会上下跳、中轴会左右跳。
+    ///
+    /// 做法：
+    ///   1. 采样待机动画（idle → posture → 第一个可用）若干帧，收集全部顶点；
+    ///   2. 脚底 = 所有 y 的 2% 分位（跳过零星的特效点，比直接取 min 稳）；
+    ///   3. 中轴 = 「头部带」（高度上方 20%）顶点的 x 中位数，
+    ///      中位数不会被单手持武器、披风拖偏；头部带点太少时退回全体中位数；
+    ///   4. 最后把中轴夹在轮廓的 15%~85% 之间，防止异常模型算出离谱的值。
+    /// </summary>
+    private (float X, float Y) ComputeAnchor()
+    {
+        Animation? anim = Data.FindAnimation("idle") ?? Data.FindAnimation("posture");
+
+        // 注意：这里不能写 Data.Animations[0]。
+        // spine-csharp 的 ExposedList<T> 在这个版本不提供公开索引器，会报 CS0021。
+        // 用枚举取第一个，既不依赖索引器也不依赖 Items 字段名。
+        if (anim == null)
+        {
+            foreach (var a in Data.Animations)
+            {
+                anim = a;
+                break;
+            }
+        }
+
+        var xs = new List<float>(2048);
+        var ys = new List<float>(2048);
+
+        void Collect()
+        {
+            foreach (var slot in Skeleton.DrawOrder)
+            {
+                if (slot.Attachment is not VertexAttachment va || va.WorldVerticesLength < 2) continue;
+
+                var verts = new float[va.WorldVerticesLength];
+                va.ComputeWorldVertices(slot, verts);
+                for (int i = 0; i + 1 < verts.Length; i += 2)
+                {
+                    xs.Add(verts[i]);
+                    ys.Add(verts[i + 1]);
+                }
+            }
+        }
+
+        if (anim != null)
+        {
+            float dur = anim.Duration <= 0 ? 0.1f : anim.Duration;
+            const int steps = 12;
+            for (int i = 0; i < steps; i++)
+            {
+                anim.Apply(Skeleton, 0f, dur * i / steps, false, null, 1f, MixBlend.Setup, MixDirection.In);
+                Skeleton.UpdateWorldTransform(Skeleton.Physics.None);
+                Collect();
+            }
+        }
+        else
+        {
+            Skeleton.SetToSetupPose();
+            Skeleton.UpdateWorldTransform(Skeleton.Physics.None);
+            Collect();
+        }
+
+        // 恢复干净状态
+        Skeleton.SetToSetupPose();
+        State.Apply(Skeleton);
+        Skeleton.UpdateWorldTransform(Skeleton.Physics.None);
+
+        if (xs.Count == 0)
+            return ((Bounds.MinX + Bounds.MaxX) / 2f, Bounds.MinY);
+
+        var sortedY = new List<float>(ys);
+        sortedY.Sort();
+        int loIdx = Math.Clamp((int)(sortedY.Count * 0.02f), 0, sortedY.Count - 1);
+        int hiIdx = Math.Clamp((int)(sortedY.Count * 0.98f), 0, sortedY.Count - 1);
+        float groundY = sortedY[loIdx];
+        float topY = sortedY[hiIdx];
+        float bodyH = Math.Max(1e-3f, topY - groundY);
+
+        // 头部带：上方 20%
+        float headCut = topY - bodyH * 0.20f;
+        var headXs = new List<float>(256);
+        for (int i = 0; i < ys.Count; i++)
+            if (ys[i] >= headCut) headXs.Add(xs[i]);
+
+        var pick = headXs.Count >= 8 ? headXs : xs;
+        pick.Sort();
+        float axisX = pick[pick.Count / 2];
+
+        float spanX = Math.Max(1e-3f, Bounds.MaxX - Bounds.MinX);
+        axisX = Math.Clamp(axisX, Bounds.MinX + spanX * 0.15f, Bounds.MaxX - spanX * 0.15f);
+
+        Logger.Log($"[Anchor] 中轴 x={axisX:0.0} 脚底 y={groundY:0.0} "
+                   + $"（头顶 y={topY:0.0} 身高 {bodyH:0.0}；"
+                   + $"包围盒中心 x={(Bounds.MinX + Bounds.MaxX) / 2f:0.0} y={(Bounds.MinY + Bounds.MaxY) / 2f:0.0}）");
+
+        return (axisX, groundY);
+    }
+
+    /// <summary>
+    /// 包围盒自检：比较「最终框」和「每一帧的实际尺寸」。
+    /// 最大单帧明显大于最终框时，说明有帧注定被裁 —— 排查"渲染超出窗口"的第一手数据。
+    /// </summary>
+    private static void LogBoundsDiagnosis(
+        List<(float X0, float Y0, float X1, float Y1)> frames,
+        float x0, float y0, float x1, float y1)
+    {
+        float finalW = Math.Max(1e-3f, x1 - x0);
+        float finalH = Math.Max(1e-3f, y1 - y0);
+
+        float maxFW = 0f, maxFH = 0f;
+        foreach (var f in frames)
+        {
+            float w = f.X1 - f.X0, h = f.Y1 - f.Y0;
+            if (w > maxFW) maxFW = w;
+            if (h > maxFH) maxFH = h;
+        }
+
+        Logger.Log($"[Bounds] 采样 {frames.Count} 帧 → 最终框 {finalW:0}×{finalH:0}"
+                 + $"，最大单帧 {maxFW:0}×{maxFH:0}");
+
+        if (maxFW > finalW * 1.02f || maxFH > finalH * 1.02f)
+        {
+            Logger.Log($"[Bounds] ⚠ 存在比最终框更大的帧"
+                     + $"（宽 +{(maxFW / finalW - 1) * 100:0}%，高 +{(maxFH / finalH - 1) * 100:0}%）"
+                     + "，这些帧会被裁掉");
+        }
+    }
+
+    /// <summary>取四边各的 10% / 90% 分位，排除大幅位移的异常帧。</summary>
+    private static (float X0, float Y0, float X1, float Y1) QuantileBox(
+        List<(float X0, float Y0, float X1, float Y1)> frames)
+    {
+        static float Pick(List<float> values, float p)
+        {
+            if (values.Count == 0) return 0f;
+            values.Sort();
+            int i = (int)Math.Round((values.Count - 1) * p, MidpointRounding.AwayFromZero);
+            return values[Math.Clamp(i, 0, values.Count - 1)];
+        }
+
+        var left = new List<float>(frames.Count);
+        var top = new List<float>(frames.Count);
+        var right = new List<float>(frames.Count);
+        var bottom = new List<float>(frames.Count);
+
+        foreach (var f in frames)
+        {
+            left.Add(f.X0);
+            top.Add(f.Y0);
+            right.Add(f.X1);
+            bottom.Add(f.Y1);
+        }
+
+        return (Pick(left, 0.10f), Pick(top, 0.10f), Pick(right, 0.90f), Pick(bottom, 0.90f));
     }
 
     public void Dispose()

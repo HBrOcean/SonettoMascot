@@ -18,12 +18,20 @@ public sealed class TrayService : IDisposable
         Action onToggleWindow,
         Action onQuit,
         IReadOnlyList<string> actionNames,
-        Action<string> onPlayAction)
+        Action<string> onPlayAction,
+        IReadOnlyList<SkinEntry> skins,
+        string currentSkinId,
+        Action<string> onSwitchSkin,
+        Action onResetPosition)
     {
+        // 提示里带上当前皮肤名：托盘图标长一个样，换了几套皮肤后靠它一眼认出当前是谁
+        string skinName = SkinCatalog.DisplayNameOf(currentSkinId);
         _tray = new TrayIcon
         {
             Icon = LoadIcon(),
-            ToolTipText = "SonettoMascot",
+            ToolTipText = string.IsNullOrWhiteSpace(skinName)
+                ? "SonettoMascot"
+                : $"SonettoMascot · {skinName}",
         };
 
         var menu = new NativeMenu();
@@ -31,6 +39,34 @@ public sealed class TrayService : IDisposable
         var miShow = new NativeMenuItem("显示 / 隐藏桌宠");
         miShow.Command = new RelayCommand(onToggleWindow);
         menu.Add(miShow);
+
+        // 皮肤子菜单：换皮肤不该只能进设置面板翻页签
+        if (skins.Count > 0)
+        {
+            var miSkin = new NativeMenuItem("皮肤");
+            var sub = new NativeMenu();
+            foreach (var s in skins)
+            {
+                var it = new NativeMenuItem(s.IsUsable ? s.DisplayName : s.DisplayName + "（资源缺失）")
+                {
+                    ToggleType = NativeMenuItemToggleType.Radio,
+                    IsChecked = string.Equals(s.Id, currentSkinId, StringComparison.OrdinalIgnoreCase),
+                };
+                if (!s.IsUsable)
+                {
+                    // 缺资源的皮肤点了也加载不了，直接置灰
+                    it.IsEnabled = false;
+                }
+                else
+                {
+                    string captured = s.Id;
+                    it.Command = new RelayCommand(() => onSwitchSkin(captured));
+                }
+                sub.Add(it);
+            }
+            miSkin.Menu = sub;
+            menu.Add(miSkin);
+        }
 
         // 快速动作子菜单
         if (actionNames.Count > 0)
@@ -49,6 +85,12 @@ public sealed class TrayService : IDisposable
         }
 
         menu.Add(new NativeMenuItemSeparator());
+
+        // 窗口允许拖到屏幕外，所以这是唯一始终点得到的自救入口：
+        // 托盘图标固定在任务栏，不受窗口位置影响。
+        var miReset = new NativeMenuItem("重置位置（拉回主屏右下角）");
+        miReset.Command = new RelayCommand(onResetPosition);
+        menu.Add(miReset);
 
         var miSettings = new NativeMenuItem("设置…");
         miSettings.Command = new RelayCommand(onOpenSettings);

@@ -10,24 +10,48 @@ internal static class Program
     // 单实例 Mutex 名（每用户唯一）
     private const string SingleInstanceName = "SonettoMascot_SingleInstance_7F3A";
 
+    /// <summary>
+    /// 命名事件：第二个实例用它唤醒第一个实例（把设置面板亮出来）。
+    /// 否则用户双击第二次时完全没反应——既没新窗口也没提示，会以为程序坏了。
+    /// </summary>
+    internal const string ActivateEventName = "SonettoMascot_Activate_7F3A";
+
     [STAThread]
     public static void Main(string[] args)
     {
-        // 开发诊断：--dump 渲染一帧到临时目录，不开窗口；--dump-all 渲染全部皮肤
+        // 开发诊断（不开窗口）：
+        //   --dump           渲染第一套可用皮肤
+        //   --dump <id>      渲染指定皮肤
+        //   --dump-all       依次渲染全部可用皮肤（换肤对齐的回归手段）
         if (args.Length > 0 && (args[0] == "--dump" || args[0] == "--dump-all"))
         {
-            string[] ids = args[0] == "--dump-all"
-                ? SonettoMascot.Config.AppConfig.AvailableSkins
-                : new[] { args.Length > 1 ? args[1] : "302301" };
-            foreach (var id in ids) Diagnostics.Dump(id);
+            if (args[0] == "--dump-all")
+            {
+                foreach (var e in SkinCatalog.All)
+                    if (e.IsUsable) Diagnostics.Dump(e.Id);
+            }
+            else
+            {
+                Diagnostics.Dump(args.Length > 1 ? args[1] : null);
+            }
             return;
         }
 
-        // 单实例保护：已有实例在运行则直接退出，避免起两个桌宠
+        // 单实例保护：已有实例在运行则通知它现身，不要静默退出
         using var mutex = new Mutex(true, SingleInstanceName, out bool createdNew);
         if (!createdNew)
         {
-            Logger.Log("检测到已有实例在运行，本次启动退出。");
+            try
+            {
+                using var ev = EventWaitHandle.OpenExisting(ActivateEventName);
+                ev.Set();
+                Logger.Log("检测到已有实例，已通知它显示窗口。");
+            }
+            catch (Exception ex)
+            {
+                // 命名事件打不开（权限/旧版本实例）就退回静默退出，不影响正确性
+                Logger.Log("检测到已有实例在运行，本次启动退出（唤醒通知失败：" + ex.Message + "）");
+            }
             return;
         }
 

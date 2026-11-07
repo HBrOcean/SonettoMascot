@@ -26,35 +26,59 @@ public sealed class AppConfig
     // —— 窗口/桌宠外观 ——
     public double WindowX { get; set; } = -1;   // -1 = 自动定位
     public double WindowY { get; set; } = -1;
-    public double Scale { get; set; } = 0.85;    // 桌宠缩放（Sonetto 模型约 310 单位高，0.85 约合 285 DIP）
+    public double Scale { get; set; } = 0.85;   // 桌宠缩放（Sonetto 模型约 310 单位高，0.85 约合 285 DIP）
+    /// <summary>已弃用：保留只为兼容旧配置文件，实际以 ZOrder 为准。</summary>
     public bool Topmost { get; set; } = true;
-    public bool ShowWhiteCard { get; set; } = false; // 白卡片背景（保底/调试）
+
+    /// <summary>窗口层级：top = 始终最上层 / bottom = 始终最下层 / free = 自由跟随普通窗口。</summary>
+    public string ZOrder { get; set; } = "top";
     public bool Clickable { get; set; } = true;
     public bool LockOnAction { get; set; } = true;    // 动作锁定：播完才回待机
 
+    // —— 窗口行为 ——
+    public bool ShowInTaskbar { get; set; } = false;  // 在任务栏显示图标
+    public bool LockPosition { get; set; } = false;   // 禁止拖动（点击仍可触发动作）
+    public bool MouseThrough { get; set; } = false;   // 鼠标穿透（点击落到下层窗口）
+    public bool Bobbing { get; set; } = false;        // 上下浮动
+    public bool Flip { get; set; } = false;           // 水平翻转
+    public bool GlassMode { get; set; } = false;      // 玻璃模式：设置面板用毛玻璃半透明背景
+
     // —— 皮肤（角色 assetId）——
-    public string Skin { get; set; } = "302301";
+    /// <summary>当前皮肤 id。空 = 启动时自动选第一套可用皮肤。</summary>
+    public string Skin { get; set; } = "";
 
-    /// <summary>可用的四套皮肤（十四行诗 · Sonetto 的服装）。</summary>
-    public static readonly string[] AvailableSkins = { "302301", "302303", "302304", "302306" };
+    // 可用皮肤列表由 SkinCatalog 扫描 Assets/characters 得到，不再硬编码。
+    // 顺序规则、显示名兜底都集中在 Services/SkinCatalog.cs。
 
-    /// <summary>皮肤显示名。</summary>
-    public static string SkinDisplayName(string id) => id switch
-    {
-        "302301" => "默认",
-        "302303" => "巡礼颂",
-        "302304" => "重叠的词句",
-        "302306" => "诗的礼赞",
-        _ => id,
-    };
+    /// <summary>
+    /// 皮肤显示名覆盖表：id → 自定义名。这是三级兜底的第一级
+    /// （配置名 → display.txt → 目录名）。
+    ///
+    /// 存在配置里而不是资源目录里，好处是：改名不用动 Assets，
+    /// 而且换模型目录、删了再放回来，名字也不会丢。
+    /// 例：{ "302301": "十四行诗" }
+    /// </summary>
+    public Dictionary<string, string> SkinNames { get; set; } = new();
 
     // —— 动作 ——
     public string IdleAnimation { get; set; } = "idle";   // 待机（默认 idle，不存在时回退第一个）
     public string ClickAnimation { get; set; } = "";  // 点击动作（空=自动挑一个）
 
     // —— 行为 ——
-    public bool SnapToEdge { get; set; } = true;  // 屏幕边缘吸附
+    public bool SnapToEdge { get; set; } = false; // 屏幕边缘吸附（默认关闭，允许自由摆放／拖到屏幕外）
     public bool AutoStart { get; set; } = false;  // 开机自启
+
+    /// <summary>定时随机动作：每隔一段时间自动播一个，让角色看起来是活的。</summary>
+    public bool AutoPlay { get; set; } = true;
+
+    /// <summary>定时随机动作的间隔（秒）。任何一次手动动作都会重新计时。</summary>
+    public double AutoPlayIntervalSeconds { get; set; } = 20;
+
+    /// <summary>
+    /// 窗口随动作自适应：动作幅度变大时窗口跟着长大，动作结束慢慢缩回。
+    /// 关掉则窗口始终按静态包围盒（最省 CPU，也最稳）。
+    /// </summary>
+    public bool DynamicSize { get; set; } = true;
 
     // —— 按键映射 ——
     public List<KeyBinding> KeyBindings { get; set; } = new();
@@ -121,6 +145,13 @@ public static class ConfigStore
                     // 只要配置里没有任何一条「键名有效」的绑定，就补一份默认。
                     // 用"是否有有效绑定"而不是 Count>0 判断：旧版本可能留下
                     // Key 为空的空壳条目，导致快捷键整表失效。
+                    // 旧配置没有 ZOrder：从 Topmost 推导，保证升级后行为不变
+                    if (string.IsNullOrWhiteSpace(cfg.ZOrder))
+                    {
+                        cfg.ZOrder = cfg.Topmost ? "top" : "free";
+                        Logger.Log($"[Config] 迁移窗口层级: Topmost={cfg.Topmost} → ZOrder={cfg.ZOrder}");
+                    }
+
                     bool hasValid = cfg.KeyBindings.Exists(kb => !string.IsNullOrWhiteSpace(kb.Key));
                     if (!hasValid)
                     {
@@ -128,6 +159,11 @@ public static class ConfigStore
                         Logger.Log("[Config] 未发现有效按键绑定，已写入默认快捷键");
                     }
                     cfg.DefaultKeysApplied = true;
+
+                    // 在任何人读 SkinCatalog.All 之前把「配置名」这一级塞进去，
+                    // 否则卡片上会先显示 display.txt / 目录名，再"变"成配置名。
+                    SkinCatalog.SetConfiguredNames(cfg.SkinNames);
+
                     return cfg;
                 }
             }
@@ -137,11 +173,13 @@ public static class ConfigStore
             Console.Error.WriteLine("[ConfigStore] load failed: " + ex.Message);
         }
         // 首次运行：直接带默认快捷键
-        return new AppConfig
+        var fresh = new AppConfig
         {
             KeyBindings = AppConfig.CreateDefaultBindings(),
             DefaultKeysApplied = true,
         };
+        SkinCatalog.SetConfiguredNames(fresh.SkinNames);
+        return fresh;
     }
 
     public static void Save(AppConfig cfg)

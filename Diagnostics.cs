@@ -9,18 +9,40 @@ namespace SonettoMascot;
 /// <summary>诊断：绕开 Avalonia，直接渲染一帧到 /tmp/dump.png，并打印附件信息。</summary>
 public static class Diagnostics
 {
-    public static void Dump(string id = "302301")
+    /// <param name="id">
+    /// 要渲染的皮肤 id；留空则取第一套可用皮肤。
+    /// 多套皮肤一起验证（例如换肤后脚底是否对齐）时传具体 id 逐个跑。
+    /// </param>
+    public static void Dump(string? id = null)
     {
-        string dir = Path.Combine(AppContext.BaseDirectory, "Assets", "characters", id);
-        Console.WriteLine("[Dump] 角色: " + id);
+        // 不写死具体 id：默认取第一套扫描到的可用皮肤
+        var all = SonettoMascot.Services.SkinCatalog.All;
+        var entry = string.IsNullOrWhiteSpace(id)
+            ? all.FirstOrDefault(e => e.IsUsable)
+            : all.FirstOrDefault(e => e.IsUsable
+                && string.Equals(e.Id, id, StringComparison.OrdinalIgnoreCase));
+
+        if (entry?.Dir == null)
+        {
+            Console.WriteLine(string.IsNullOrWhiteSpace(id)
+                ? "[Dump] 没有可用的皮肤，先确认 Assets/characters 下有 .atlas/.skel"
+                : $"[Dump] 皮肤 {id} 不可用（目录缺失或资源不全）");
+            return;
+        }
+
+        string dir = entry.Dir;
+        Console.WriteLine("[Dump] 皮肤: " + entry.Id + "（" + entry.DisplayName + "，名称来源 " + entry.NameSource + "）");
         Console.WriteLine("[Dump] atlas 目录: " + dir);
+        string skinId = entry.Id;
         var model = new SkeletonModel(
-            Path.Combine(dir, id + ".atlas"),
-            Path.Combine(dir, id + ".skel"));
+            Path.Combine(dir, skinId + ".atlas"),
+            Path.Combine(dir, skinId + ".skel"));
 
         Console.WriteLine("[Dump] 动画: " + string.Join(", ", model.AnimationNames));
         var b = model.Bounds;
         Console.WriteLine($"[Dump] Bounds: {b.MinX:F1},{b.MinY:F1} .. {b.MaxX:F1},{b.MaxY:F1}");
+        // 换肤时角色会不会上下跳、左右跳，全看这两个值的稳定性
+        Console.WriteLine($"[Dump] Anchor: ({model.AnchorX:F1}, {model.AnchorY:F1})  ← 中轴 / 脚底");
 
         model.Update(0f);
 
@@ -76,7 +98,7 @@ public static class Diagnostics
         using var img = surface.Snapshot();
         using var data = img.Encode(SKEncodedImageFormat.Png, 100);
         // 用系统临时目录（Windows 没有 /tmp）
-        string outPath = Path.Combine(Path.GetTempPath(), $"SonettoMascot-dump-{id}.png");
+        string outPath = Path.Combine(Path.GetTempPath(), $"SonettoMascot-dump-{skinId}.png");
         File.WriteAllBytes(outPath, data.ToArray());
         Console.WriteLine("[Dump] 已保存 " + outPath);
     }
